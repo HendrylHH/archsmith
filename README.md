@@ -96,6 +96,38 @@ On Windows, use an absolute path such as:
 }
 ```
 
+### Claude Code Plugin
+
+ArchSmith can be installed as a Claude Code plugin. The plugin bundles the same local stdio MCP server, so Claude Code can start it automatically when the plugin is enabled.
+
+In Claude Code, add this repository as a plugin marketplace and install ArchSmith:
+
+```text
+/plugin marketplace add HendrylHH/archsmith
+/plugin install archsmith@archsmith
+/reload-plugins
+```
+
+Check that the bundled MCP server is connected:
+
+```text
+/mcp
+```
+
+After installation, Claude Code should expose ArchSmith's MCP tools from the plugin-provided server. For example, the low-token path is still `archsmith_materialize_by_name`, just surfaced through Claude Code's MCP tool naming.
+
+For local development, you can load the plugin directly from the repository root:
+
+```bash
+claude --plugin-dir ./plugins/archsmith
+```
+
+If you do not want to install the plugin, you can still add the MCP server directly:
+
+```bash
+claude mcp add --transport stdio archsmith -- python /absolute/path/to/plugins/archsmith/mcp/server.py --stdio
+```
+
 ### Codex Plugin
 
 This repository includes a marketplace file at `.agents/plugins/marketplace.json` and the plugin source at `plugins/archsmith`.

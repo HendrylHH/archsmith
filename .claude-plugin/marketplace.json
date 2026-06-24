@@ -1,0 +1,27 @@
+{
+  "name": "archsmith",
+  "owner": {
+    "name": "ArchSmith"
+  },
+  "description": "ArchSmith Claude Code plugin marketplace.",
+  "plugins": [
+    {
+      "name": "archsmith",
+      "source": "./plugins/archsmith",
+      "displayName": "ArchSmith",
+      "description": "Local-first approved engineering memory with reusable functions and a bundled MCP server.",
+      "author": {
+        "name": "ArchSmith"
+      },
+      "license": "MIT",
+      "keywords": [
+        "mcp",
+        "claude-code",
+        "engineering-memory",
+        "code-reuse",
+        "local-first"
+      ],
+      "category": "productivity"
+    }
+  ]
+}

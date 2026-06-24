@@ -1,0 +1,30 @@
+{
+  "name": "archsmith",
+  "displayName": "ArchSmith",
+  "description": "Local-first approved engineering memory with reusable functions and a bundled MCP server.",
+  "author": {
+    "name": "ArchSmith"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "engineering-memory",
+    "code-reuse",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "archsmith-mcp": {
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/server.py",
+        "--stdio"
+      ],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
