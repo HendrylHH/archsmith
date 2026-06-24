@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../../assets/logo.png" alt="ArchSmith logo" width="420">
+</p>
+
 # ArchSmith
 
 ArchSmith is a local-first engineering memory plugin and MCP server for reusing approved code instead of asking an AI agent to recreate the same functions again and again.
