@@ -1,0 +1,30 @@
+{
+  "name": "archsmith",
+  "version": "0.1.0+codex.20260624144837",
+  "description": "Local engineering memory for approved reusable project functions.",
+  "author": {
+    "name": "ArchSmith"
+  },
+  "keywords": [
+    "mcp",
+    "codex",
+    "engineering-memory",
+    "code-reuse",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ArchSmith",
+    "shortDescription": "Reuse approved local engineering functions.",
+    "longDescription": "ArchSmith provides a local MCP-backed memory for approved reusable project functions, recipes, metadata, and reuse history.",
+    "developerName": "ArchSmith",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": []
+  },
+  "mcpServers": "./.mcp.json"
+}

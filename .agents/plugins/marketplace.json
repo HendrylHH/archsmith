@@ -1,0 +1,20 @@
+{
+  "name": "archsmith",
+  "interface": {
+    "displayName": "ArchSmith"
+  },
+  "plugins": [
+    {
+      "name": "archsmith",
+      "source": {
+        "source": "local",
+        "path": "./plugins/archsmith"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

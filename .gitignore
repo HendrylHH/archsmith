@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-tmp/
+.validation-tmp/
+.DS_Store
+archsmith.sqlite3
+code/

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "archsmith-mcp": {
+      "command": "python",
+      "args": [
+        "./mcp/server.py",
+        "--stdio"
+      ],
+      "cwd": ".",
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "tool_timeout_sec": 120
+    }
+  }
+}

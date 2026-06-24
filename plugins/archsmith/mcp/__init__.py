@@ -1,0 +1,2 @@
+"""ArchSmith MCP package."""
+
