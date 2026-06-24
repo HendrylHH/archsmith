@@ -23,6 +23,20 @@ AI coding agents spend a lot of output tokens regenerating code that already exi
 
 The default mutation threshold is `20%`. Larger changes become new candidates and require explicit approval.
 
+## Previously Approved Memory
+
+ArchSmith is designed to act as previously approved engineering memory.
+
+That means the agent should not treat stored functions as vague suggestions or conversational notes. A function only becomes reusable memory after it has been explicitly proposed, reviewed, and approved. Once approved, the agent can retrieve its contract, metadata, version, and local source file without spending tokens reconstructing the same implementation from scratch.
+
+This makes ArchSmith closer to a local catalog of approved building blocks than a generic memory system:
+
+- approved code is reused by name, context, and version;
+- stored code is not printed into chat unless inspection is required;
+- small adaptations are allowed only within the mutation threshold;
+- larger changes become new candidate versions and need approval;
+- reuse is logged locally so the history remains auditable.
+
 ## What ArchSmith Provides
 
 - A local SQLite store for users, profiles, knowledge areas, modules, functions, revisions, and reuse logs.
