@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -441,6 +442,101 @@ class StoreCase(unittest.TestCase):
     def test_secret_like_assignment_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             self.propose("to" + "ken = 'abcdefghi'\n")
+
+    def test_configurable_mutation_threshold(self) -> None:
+        old = os.environ.get("ARCHSMITH_MUTATION_THRESHOLD")
+        os.environ["ARCHSMITH_MUTATION_THRESHOLD"] = "0.50"
+        try:
+            # 1. Propose base version
+            first = self.propose("def fn():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n")
+            self.store.approve_function({"revision_id": first["revision_id"], "approved_by": "u"})
+            
+            # 2. Propose revision with ~40% mutation
+            second = self.propose("def fn():\n    a = 10\n    b = 20\n    c = 3\n    return a + b + c\n")
+            
+            # Since threshold is 0.50 (50%), it should not require a new public version candidate
+            self.assertEqual(second["public_version"], 1)
+            self.assertFalse(second["requires_new_version"])
+            
+            # 3. Change threshold to 0.10 (10%)
+            os.environ["ARCHSMITH_MUTATION_THRESHOLD"] = "0.10"
+            third = self.propose("def fn():\n    a = 1\n    b = 2\n    c = 100\n    return a + b + c\n")
+            
+            # It should require a new version because mutation exceeds 10%
+            self.assertEqual(third["public_version"], 2)
+            self.assertTrue(third["requires_new_version"])
+        finally:
+            if old is None:
+                os.environ.pop("ARCHSMITH_MUTATION_THRESHOLD", None)
+            else:
+                os.environ["ARCHSMITH_MUTATION_THRESHOLD"] = old
+
+    def test_database_migration_v1_to_v2(self) -> None:
+        # Create a clean temp folder and set up a raw SQLite db representing v1 schema (no schema_version, no fts)
+        temp_root = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        db_path = Path(temp_root.name) / "archsmith.sqlite3"
+        
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE contexts (
+                id INTEGER PRIMARY KEY,
+                user_slug TEXT NOT NULL, user_name TEXT NOT NULL,
+                profile_slug TEXT NOT NULL, profile_name TEXT NOT NULL,
+                knowledge_slug TEXT NOT NULL, knowledge_name TEXT NOT NULL,
+                module_slug TEXT NOT NULL, module_name TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(user_slug, profile_slug, knowledge_slug, module_slug)
+            );
+            CREATE TABLE functions (
+                id INTEGER PRIMARY KEY,
+                context_id INTEGER NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+                slug TEXT NOT NULL, name TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(context_id, slug)
+            );
+            CREATE TABLE revisions (
+                id INTEGER PRIMARY KEY,
+                function_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+                public_version INTEGER NOT NULL, revision INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'deprecated')),
+                summary TEXT NOT NULL, language TEXT NOT NULL,
+                runtime TEXT, signature TEXT, inputs_json TEXT, outputs_json TEXT,
+                dependencies_json TEXT, environment_json TEXT, side_effects TEXT,
+                usage_notes TEXT, limitations TEXT, tags_json TEXT,
+                code_hash TEXT NOT NULL, code_path TEXT NOT NULL,
+                normalized_line_count INTEGER NOT NULL, diff_ratio REAL NOT NULL,
+                base_revision_id INTEGER REFERENCES revisions(id),
+                created_by TEXT, approved_by TEXT, created_at TEXT NOT NULL, approved_at TEXT,
+                metadata_json TEXT,
+                UNIQUE(function_id, public_version, revision)
+            );
+            INSERT INTO contexts VALUES (1, 'u', 'u', 'p', 'p', 'k', 'k', 'm', 'm', 'now', 'now');
+            INSERT INTO functions VALUES (1, 1, 'my-func', 'my_func', 'now', 'now');
+            INSERT INTO revisions VALUES (1, 1, 1, 1, 'approved', 'migrated summary', 'python',
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '[]',
+                'hash', 'code/1.py', 5, 1.0, NULL, 'u', 'u', 'now', 'now', '{}');
+            """
+        )
+        conn.close()
+        
+        # Instantiate store - this should trigger migration from v1 to v2!
+        store = ArchSmithStore(Path(temp_root.name))
+        
+        # Verify schema_version table exists and version is 2
+        ver_row = store.conn.execute("SELECT version FROM schema_version").fetchone()
+        self.assertIsNotNone(ver_row)
+        self.assertEqual(ver_row["version"], 2)
+        
+        # Verify FTS virtual table exists and the migrated revision was indexed
+        if store._fts_supported():
+            fts_row = store.conn.execute("SELECT search_text FROM revisions_fts WHERE rowid = 1").fetchone()
+            self.assertIsNotNone(fts_row)
+            self.assertIn("migrated summary", fts_row["search_text"])
+            self.assertIn("my_func", fts_row["search_text"])
+            
+        store.close()
+        temp_root.cleanup()
 
 
 class McpCase(unittest.TestCase):

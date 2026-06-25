@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any
 
 
-MUTATION_THRESHOLD = 0.20
+def get_mutation_threshold() -> float:
+    raw = os.environ.get("ARCHSMITH_MUTATION_THRESHOLD")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return 0.20
+
 DB_FILE = "archsmith.sqlite3"
 
 
@@ -231,7 +239,65 @@ class ArchSmithStore:
     def close(self) -> None:
         self.conn.close()
 
+    def _index_revision_fts_conn(self, conn: sqlite3.Connection, r: dict[str, Any]) -> None:
+        tags_raw = r.get("tags_json")
+        tags = []
+        if isinstance(tags_raw, str):
+            try:
+                tags = json.loads(tags_raw) or []
+            except Exception:
+                tags = []
+        elif isinstance(tags_raw, list):
+            tags = tags_raw
+        if not isinstance(tags, list):
+            tags = []
+        tags_str = " ".join(str(t) for t in tags)
+        search_text = (
+            f"{r.get('function_name') or ''} "
+            f"{r.get('summary') or ''} "
+            f"{r.get('signature') or ''} "
+            f"{r.get('language') or ''} "
+            f"{r.get('runtime') or ''} "
+            f"{tags_str} "
+            f"{r.get('user_name') or ''} "
+            f"{r.get('profile_name') or ''} "
+            f"{r.get('knowledge_name') or ''} "
+            f"{r.get('module_name') or ''}"
+        ).lower().strip()
+        search_text = re.sub(r"\s+", " ", search_text)
+        conn.execute(
+            "INSERT OR REPLACE INTO revisions_fts(rowid, search_text) VALUES (?, ?)",
+            (r["id"], search_text)
+        )
+
     def _migrate(self) -> None:
+        # Create schema_version if not exists
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY
+            )
+            """
+        )
+        self.conn.commit()
+        
+        # Check current version
+        row = self.conn.execute("SELECT version FROM schema_version").fetchone()
+        if row is None:
+            # Check if contexts exists (meaning it's an existing v1 database)
+            table_exists = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='contexts'"
+            ).fetchone()
+            if table_exists:
+                current_version = 1
+                self.conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            else:
+                current_version = 2
+                self.conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            self.conn.commit()
+        else:
+            current_version = row["version"]
+
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS contexts (
@@ -301,6 +367,36 @@ class ArchSmithStore:
             """
         )
         self.conn.commit()
+
+        if self._fts_supported():
+            self.conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS revisions_fts USING fts5(search_text)")
+            self.conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_revisions_delete AFTER DELETE ON revisions
+                BEGIN
+                    DELETE FROM revisions_fts WHERE rowid = OLD.id;
+                END;
+                """
+            )
+            self.conn.commit()
+
+        if current_version < 2:
+            if self._fts_supported():
+                revisions = self.conn.execute(
+                    """
+                    SELECT r.id, r.summary, r.language, r.runtime, r.signature, r.tags_json,
+                           f.name AS function_name,
+                           c.user_name, c.profile_name, c.knowledge_name, c.module_name
+                    FROM revisions r
+                    JOIN functions f ON f.id = r.function_id
+                    JOIN contexts c ON c.id = f.context_id
+                    WHERE r.status = 'approved'
+                    """
+                ).fetchall()
+                for r in revisions:
+                    self._index_revision_fts_conn(self.conn, dict(r))
+            self.conn.execute("UPDATE schema_version SET version = 2")
+            self.conn.commit()
 
     def upsert_context(self, data: dict[str, Any]) -> dict[str, Any]:
         user = str(data.get("user", "")).strip()
@@ -420,7 +516,7 @@ class ArchSmithStore:
         latest = self._latest_approved_revision(function["id"])
         previous_code = self._read_revision_code(latest) if latest else None
         diff_ratio = normalized_diff_ratio(previous_code, code)
-        requires_new_version = bool(latest and diff_ratio > MUTATION_THRESHOLD)
+        requires_new_version = bool(latest and diff_ratio > get_mutation_threshold())
         max_public_version = self._max_public_version(function["id"])
         public_version = (max_public_version + 1) if requires_new_version else (latest["public_version"] if latest else 1)
         revision = self._next_revision(function["id"], public_version)
@@ -451,13 +547,13 @@ class ArchSmithStore:
                 data.get("side_effects"),
                 data.get("usage_notes"),
                 data.get("limitations"),
-                json_dumps(data.get("tags") or []),
+                json_dumps(data.get("tags")),
                 code_hash,
                 relative_path,
                 len(normalize_code_lines(code)),
                 diff_ratio,
-                latest["id"] if latest else None,
-                data.get("proposed_by") or data.get("client"),
+                data.get("base_revision_id") or (latest["id"] if latest else None),
+                data.get("proposed_by"),
                 now,
                 json_dumps(data.get("metadata")),
             ),
@@ -471,7 +567,7 @@ class ArchSmithStore:
             "public_version": revision_row["public_version"],
             "revision": revision_row["revision"],
             "diff_ratio": diff_ratio,
-            "mutation_threshold": MUTATION_THRESHOLD,
+            "mutation_threshold": get_mutation_threshold(),
             "requires_new_version": requires_new_version,
             "requires_explicit_approval": True,
         }
@@ -492,6 +588,24 @@ class ArchSmithStore:
             (approved_by, now, revision_id),
         )
         self.conn.commit()
+        
+        if self._fts_supported():
+            r = self.conn.execute(
+                """
+                SELECT r.id, r.summary, r.language, r.runtime, r.signature, r.tags_json,
+                       f.name AS function_name,
+                       c.user_name, c.profile_name, c.knowledge_name, c.module_name
+                FROM revisions r
+                JOIN functions f ON f.id = r.function_id
+                JOIN contexts c ON c.id = f.context_id
+                WHERE r.id = ?
+                """,
+                (revision_id,)
+            ).fetchone()
+            if r:
+                self._index_revision_fts_conn(self.conn, dict(r))
+                self.conn.commit()
+
         updated = self._revision_by_id(revision_id)
         return self._revision_payload(updated, include_code=False)
 
@@ -504,8 +618,10 @@ class ArchSmithStore:
         limit = max(1, min(limit, 50))
         detail = bool(data.get("detail"))
 
-        where = ["r.status = 'approved'"]
+        # Filter: only latest approved revision per function
+        where = ["r.id IN (SELECT MAX(id) FROM revisions WHERE status = 'approved' GROUP BY function_id)"]
         params: list[Any] = []
+
         context_filter = data.get("context") if isinstance(data.get("context"), dict) else data
         for field in ("user", "profile", "knowledge", "module"):
             value = context_filter.get(field) if isinstance(context_filter, dict) else None
@@ -515,34 +631,54 @@ class ArchSmithStore:
         if language:
             where.append("lower(r.language) = ?")
             params.append(language)
-        sql = f"""
-            SELECT r.*, f.name AS function_name, f.slug AS function_slug,
-                   c.user_name, c.profile_name, c.knowledge_name, c.module_name,
-                   c.user_slug, c.profile_slug, c.knowledge_slug, c.module_slug
-            FROM revisions r
-            JOIN functions f ON f.id = r.function_id
-            JOIN contexts c ON c.id = f.context_id
-            WHERE {' AND '.join(where)}
-            ORDER BY r.approved_at DESC, r.id DESC
-        """
-        rows = list(self.conn.execute(sql, params))
-        row_documents: list[str] = []
-        unique_rows: list[sqlite3.Row] = []
-        seen: set[int] = set()
-        for row in rows:
-            if row["function_id"] in seen:
-                continue
-            seen.add(row["function_id"])
-            payload = self._revision_payload(row, include_code=False)
-            tags = {str(tag).lower() for tag in payload.get("tags") or []}
-            if tags_filter and not tags_filter.issubset(tags):
-                continue
-            unique_rows.append(row)
-            row_documents.append(self._metadata_search_text(payload))
+        for tag in tags_filter:
+            where.append("r.tags_json LIKE ?")
+            params.append(f'%"{tag}"%')
 
-        fts_matches = self._fts_match_indexes(row_documents, terms)
+        use_fts = False
+        if terms and self._fts_supported():
+            safe_terms = [term for term in terms if re.match(r"^[A-Za-z0-9_]+$", term)]
+            if safe_terms:
+                use_fts = True
+                fts_query = " OR ".join(f"{term}*" for term in safe_terms)
+                where.append("fts.search_text MATCH ?")
+                params.append(fts_query)
+
+        if use_fts:
+            sql = f"""
+                SELECT r.*, f.name AS function_name, f.slug AS function_slug,
+                       c.user_name, c.profile_name, c.knowledge_name, c.module_name,
+                       c.user_slug, c.profile_slug, c.knowledge_slug, c.module_slug,
+                       fts.rank
+                FROM revisions r
+                JOIN functions f ON f.id = r.function_id
+                JOIN contexts c ON c.id = f.context_id
+                JOIN revisions_fts fts ON fts.rowid = r.id
+                WHERE {' AND '.join(where)}
+                ORDER BY fts.rank ASC, r.approved_at DESC, r.id DESC
+                LIMIT ?
+            """
+        else:
+            if terms:
+                for term in terms:
+                    where.append("(lower(f.name) LIKE ? OR lower(r.summary) LIKE ?)")
+                    params.extend([f"%{term}%", f"%{term}%"])
+            sql = f"""
+                SELECT r.*, f.name AS function_name, f.slug AS function_slug,
+                       c.user_name, c.profile_name, c.knowledge_name, c.module_name,
+                       c.user_slug, c.profile_slug, c.knowledge_slug, c.module_slug
+                FROM revisions r
+                JOIN functions f ON f.id = r.function_id
+                JOIN contexts c ON c.id = f.context_id
+                WHERE {' AND '.join(where)}
+                ORDER BY r.approved_at DESC, r.id DESC
+                LIMIT ?
+            """
+        params.append(limit)
+        rows = list(self.conn.execute(sql, params))
+
         results: list[dict[str, Any]] = []
-        for index, row in enumerate(unique_rows):
+        for row in rows:
             payload = self._revision_payload(row, include_code=False)
             searchable = " ".join(
                 str(part or "")
@@ -565,7 +701,7 @@ class ArchSmithStore:
                 score = term_hits / len(terms)
                 if term_hits:
                     reasons.append("term_match")
-                if index in fts_matches:
+                if use_fts:
                     score = min(1.0, score + 0.20)
                     reasons.append("fts_match")
             else:
@@ -578,13 +714,11 @@ class ArchSmithStore:
                 reasons.append("tag_filter")
             if language:
                 reasons.append("language_filter")
-            if terms and score == 0:
-                continue
             payload["score"] = round(score, 6)
             payload["score_reasons"] = reasons
             results.append(payload if detail else self._compact_revision_payload(payload))
         results.sort(key=lambda item: (item["score"], item.get("approved_at") or ""), reverse=True)
-        return {"functions": results[:limit], "count": min(len(results), limit)}
+        return {"functions": results, "count": len(results)}
 
     def recommend_reuse(self, data: dict[str, Any]) -> dict[str, Any]:
         task = str(data.get("task") or "").strip()
@@ -818,7 +952,7 @@ class ArchSmithStore:
                 "adaptation exceeds mutation threshold",
                 error_code="DIFF_TOO_LARGE",
                 candidates=blocked,
-                details={"mutation_threshold": MUTATION_THRESHOLD},
+                details={"mutation_threshold": get_mutation_threshold()},
             )
         overwrite = bool(data.get("overwrite"))
         for item in plans["items"]:
@@ -1000,7 +1134,7 @@ class ArchSmithStore:
                 "adaptation exceeds mutation threshold",
                 error_code="DIFF_TOO_LARGE",
                 candidates=blocked,
-                details={"mutation_threshold": MUTATION_THRESHOLD},
+                details={"mutation_threshold": get_mutation_threshold()},
             )
         return self._estimate_project_from_plans(plans)
 
@@ -1216,13 +1350,13 @@ class ArchSmithStore:
                 raise NotFoundError("stored code file was not found")
             code, replacements = apply_replacements(original_code, item.get("replacements"))
             diff_ratio = normalized_diff_ratio(original_code, code)
-            if diff_ratio > MUTATION_THRESHOLD:
+            if diff_ratio > get_mutation_threshold():
                 blocked.append(
                     {
                         "name": revision["function_name"],
                         "revision_id": revision["id"],
                         "diff_ratio": diff_ratio,
-                        "mutation_threshold": MUTATION_THRESHOLD,
+                        "mutation_threshold": get_mutation_threshold(),
                     }
                 )
             filename = validate_plain_filename(
@@ -1233,13 +1367,16 @@ class ArchSmithStore:
                 common = os.path.commonpath([str(target), str(target_root)])
             except ValueError as exc:
                 raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED") from exc
-            if common != str(target_root):
-                raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED")
+            else:
+                if common != str(target_root):
+                    raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED")
             ensure_allowed_path(target)
-            payload = self._revision_payload(revision, include_code=False)
             memory = None
             if include_memory:
+                payload = self._revision_payload(revision, include_code=False)
                 memory = {
+                    "function_id": payload["function_id"],
+                    "revision_id": payload["revision_id"],
                     "name": payload["name"],
                     "summary": payload["summary"],
                     "language": payload["language"],
@@ -1259,7 +1396,7 @@ class ArchSmithStore:
                     "adaptation": {
                         "has_replacements": bool(replacements),
                         "diff_ratio": diff_ratio,
-                        "mutation_threshold": MUTATION_THRESHOLD,
+                        "mutation_threshold": get_mutation_threshold(),
                     },
                 }
             notes = str(item.get("notes") or data.get("notes") or "").strip()
