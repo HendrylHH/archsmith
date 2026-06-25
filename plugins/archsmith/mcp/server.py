@@ -12,11 +12,11 @@ sys.dont_write_bytecode = True
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mcp.storage import ArchSmithError, ArchSmithStore, ValidationError
+from mcp.storage import ArchSmithError, ArchSmithStore, NotFoundError, ValidationError
 
 
 SERVER_NAME = "archsmith-mcp"
-PROTOCOL_VERSION = "2024-11-05"
+PROTOCOL_VERSION = "2025-06-18"
 
 
 def text_schema(description: str, required: list[str] | None = None, properties: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -97,6 +97,26 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "archsmith_recommend_reuse",
+        "description": "Recommend approved reusable functions for a task, returning confidence, reasons, and next action without code.",
+        "inputSchema": text_schema(
+            "Reuse recommendation request.",
+            required=["task"],
+            properties={
+                "task": {"type": "string"},
+                "context": text_schema("Context filters.", properties=CONTEXT_PROPERTIES),
+                "user": {"type": "string"},
+                "profile": {"type": "string"},
+                "knowledge": {"type": "string"},
+                "module": {"type": "string"},
+                "language": {"type": "string"},
+                "tags": STRING_ARRAY_SCHEMA,
+                "desired_functions": STRING_ARRAY_SCHEMA,
+                "limit": {"type": "integer", "minimum": 1, "maximum": 25},
+            },
+        ),
+    },
+    {
         "name": "archsmith_get_function",
         "description": "Get function metadata, recipe, and optionally code.",
         "inputSchema": text_schema(
@@ -164,6 +184,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "filename": {"type": "string"},
                 "overwrite": {"type": "boolean"},
                 "confirm_write": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
                 "include_hash": {"type": "boolean"},
             },
         ),
@@ -187,6 +208,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "filename": {"type": "string"},
                 "overwrite": {"type": "boolean"},
                 "confirm_write": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
                 "record_reuse": {"type": "boolean"},
                 "project_path": {"type": "string"},
                 "client": {"type": "string"},
@@ -194,6 +216,26 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "notes": {"type": "string"},
                 "allow_fuzzy": {"type": "boolean"},
                 "include_hash": {"type": "boolean"},
+            },
+        ),
+    },
+    {
+        "name": "archsmith_plan_project",
+        "description": "Plan a project from approved functions without writing files or returning code.",
+        "inputSchema": text_schema(
+            "Project planning target.",
+            required=["destination_path", "functions"],
+            properties={
+                "destination_path": {"type": "string"},
+                "functions": {"type": "array", "items": PROJECT_FUNCTION_SCHEMA, "minItems": 1},
+                "context": text_schema("Shared context filters.", properties=CONTEXT_PROPERTIES),
+                "user": {"type": "string"},
+                "profile": {"type": "string"},
+                "knowledge": {"type": "string"},
+                "module": {"type": "string"},
+                "overwrite": {"type": "boolean"},
+                "client": {"type": "string"},
+                "notes": {"type": "string"},
             },
         ),
     },
@@ -285,6 +327,59 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+PROMPT_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "reuse_named_function",
+        "description": "Materialize one approved function by name with optional context filters.",
+        "arguments": [
+            {"name": "name", "description": "Approved function name.", "required": True},
+            {"name": "destination_path", "description": "Local destination path.", "required": True},
+            {"name": "context", "description": "Optional user/profile/knowledge/module context.", "required": False},
+        ],
+    },
+    {
+        "name": "recommend_reuse_for_task",
+        "description": "Ask ArchSmith which approved functions should be reused for a task.",
+        "arguments": [
+            {"name": "task", "description": "Task or user request.", "required": True},
+            {"name": "context", "description": "Optional context filters.", "required": False},
+        ],
+    },
+    {
+        "name": "create_project_from_approved_functions",
+        "description": "Plan and then materialize a project from approved functions.",
+        "arguments": [
+            {"name": "destination_path", "description": "Local project directory.", "required": True},
+            {"name": "functions", "description": "Approved function names and optional filenames/replacements.", "required": True},
+        ],
+    },
+    {
+        "name": "approve_candidate_function",
+        "description": "Review a proposed candidate function and approve only after explicit user consent.",
+        "arguments": [
+            {"name": "revision_id", "description": "Candidate revision ID.", "required": True},
+            {"name": "approved_by", "description": "Approving user or team.", "required": True},
+        ],
+    },
+]
+
+
+RESOURCE_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "uri": "archsmith://contexts",
+        "name": "ArchSmith Contexts",
+        "description": "Stored user/profile/knowledge/module contexts.",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "archsmith://functions/approved",
+        "name": "Approved Function Metadata",
+        "description": "Approved function metadata without code.",
+        "mimeType": "application/json",
+    },
+]
+
+
 class JsonRpcServer:
     def __init__(self, debug: bool = False) -> None:
         self.debug = debug
@@ -293,12 +388,14 @@ class JsonRpcServer:
             "archsmith_list_contexts": self.store.list_contexts,
             "archsmith_upsert_context": self.store.upsert_context,
             "archsmith_search_functions": self.store.search_functions,
+            "archsmith_recommend_reuse": self.store.recommend_reuse,
             "archsmith_get_function": self.store.get_function,
             "archsmith_propose_function": self.store.propose_function,
             "archsmith_approve_function": self.store.approve_function,
             "archsmith_materialize_function": self.store.materialize_function,
             "archsmith_materialize_by_name": self.store.materialize_by_name,
             "archsmith_record_reuse": self.store.record_reuse,
+            "archsmith_plan_project": self.store.plan_project,
             "archsmith_materialize_project": self.store.materialize_project,
             "archsmith_estimate_savings": self.store.estimate_savings,
             "archsmith_estimate_project_savings": self.store.estimate_project_savings,
@@ -324,8 +421,12 @@ class JsonRpcServer:
                 requested_protocol = (message.get("params") or {}).get("protocolVersion") or PROTOCOL_VERSION
                 result = {
                     "protocolVersion": requested_protocol,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": SERVER_NAME, "version": "0.1.0"},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "prompts": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                    },
+                    "serverInfo": {"name": SERVER_NAME, "version": "0.2.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -334,11 +435,21 @@ class JsonRpcServer:
             elif method == "tools/call":
                 params = message.get("params") or {}
                 result = self.call_tool(str(params.get("name") or ""), params.get("arguments") or {})
+            elif method == "prompts/list":
+                result = {"prompts": PROMPT_DEFINITIONS}
+            elif method == "prompts/get":
+                result = self.get_prompt(message.get("params") or {})
+            elif method == "resources/list":
+                result = {"resources": self.list_resources()}
+            elif method == "resources/read":
+                result = self.read_resource(message.get("params") or {})
             else:
                 return error_response(request_id, -32601, "Method not found")
             return {"jsonrpc": "2.0", "id": request_id, "result": result}
         except ArchSmithError as exc:
-            return {"jsonrpc": "2.0", "id": request_id, "result": tool_error(str(exc))}
+            if method == "tools/call":
+                return {"jsonrpc": "2.0", "id": request_id, "result": tool_error(exc)}
+            return error_response(request_id, -32602, json.dumps(exc.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True))
         except Exception as exc:
             if self.debug:
                 traceback.print_exc(file=sys.stderr)
@@ -350,14 +461,76 @@ class JsonRpcServer:
         result = self.handlers[name](arguments)
         return tool_result(result)
 
+    def get_prompt(self, params: dict[str, Any]) -> dict[str, Any]:
+        name = str(params.get("name") or "")
+        arguments = params.get("arguments") or {}
+        prompts = {
+            "reuse_named_function": (
+                "Use archsmith_materialize_by_name with confirm_write=true, record_reuse=true, "
+                "known context filters, and no code inspection. Function: {name}. Destination: {destination_path}."
+            ),
+            "recommend_reuse_for_task": (
+                "Call archsmith_recommend_reuse for this task. If status is ready, use the suggested action. "
+                "If status is ambiguous or needs_context, ask the user for the missing context. Task: {task}."
+            ),
+            "create_project_from_approved_functions": (
+                "Call archsmith_plan_project first. If can_materialize is true and the user has approved writing, "
+                "call archsmith_materialize_project with the same function list. Destination: {destination_path}."
+            ),
+            "approve_candidate_function": (
+                "Only call archsmith_approve_function after explicit user approval. Revision ID: {revision_id}. "
+                "Approved by: {approved_by}."
+            ),
+        }
+        if name not in prompts:
+            raise NotFoundError("prompt not found")
+        class PromptArguments(dict[str, str]):
+            def __missing__(self, key: str) -> str:
+                return f"<{key}>"
+
+        text = prompts[name].format_map(PromptArguments({key: str(value) for key, value in arguments.items()}))
+        return {
+            "description": next(prompt["description"] for prompt in PROMPT_DEFINITIONS if prompt["name"] == name),
+            "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+        }
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        resources = list(RESOURCE_DEFINITIONS)
+        for function in self.store.approved_functions_metadata(limit=200)["functions"]:
+            resources.append(
+                {
+                    "uri": f"archsmith://functions/{function['function_id']}/metadata",
+                    "name": f"{function['name']} metadata",
+                    "description": "Approved function metadata without code.",
+                    "mimeType": "application/json",
+                }
+            )
+        return resources
+
+    def read_resource(self, params: dict[str, Any]) -> dict[str, Any]:
+        uri = str(params.get("uri") or "")
+        if uri == "archsmith://contexts":
+            value = self.store.list_contexts({})
+        elif uri == "archsmith://functions/approved":
+            value = self.store.approved_functions_metadata()
+        else:
+            match = uri.startswith("archsmith://functions/") and uri.endswith("/metadata")
+            if not match:
+                raise NotFoundError("resource not found")
+            function_id_text = uri.removeprefix("archsmith://functions/").removesuffix("/metadata")
+            value = self.store.function_metadata(int(function_id_text))
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}
+
 
 def tool_result(value: Any) -> dict[str, Any]:
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
-def tool_error(message: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": message}], "isError": True}
+def tool_error(error: ArchSmithError) -> dict[str, Any]:
+    text = json.dumps(error.payload(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
 def error_response(request_id: Any, code: int, message: str) -> dict[str, Any]:

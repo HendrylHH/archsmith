@@ -16,15 +16,44 @@ DB_FILE = "archsmith.sqlite3"
 
 
 class ArchSmithError(Exception):
-    pass
+    error_code = "ARCHSMITH_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str | None = None,
+        retry_with: dict[str, Any] | None = None,
+        candidates: list[dict[str, Any]] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        if error_code:
+            self.error_code = error_code
+        self.retry_with = retry_with
+        self.candidates = candidates or []
+        self.details = details or {}
+
+    def payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "error_code": self.error_code,
+            "message": self.message,
+        }
+        if self.retry_with:
+            payload["retry_with"] = self.retry_with
+        if self.candidates:
+            payload["candidates"] = self.candidates
+        if self.details:
+            payload["details"] = self.details
+        return payload
 
 
 class ValidationError(ArchSmithError):
-    pass
+    error_code = "VALIDATION_ERROR"
 
 
 class NotFoundError(ArchSmithError):
-    pass
+    error_code = "NOT_FOUND"
 
 
 def utc_now() -> str:
@@ -122,7 +151,7 @@ APPROX_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|\d+|[^\w\s]|\s+", re.UNICO
 def reject_secrets(*values: Any) -> None:
     text = "\n".join(json.dumps(value, ensure_ascii=False) for value in values if value is not None)
     if SECRET_ASSIGNMENT.search(text) or CONNECTION_STRING.search(text) or PRIVATE_KEY.search(text):
-        raise ValidationError("Secret-like material is not allowed in ArchSmith memory")
+        raise ValidationError("Secret-like material is not allowed in ArchSmith memory", error_code="SECRET_DETECTED")
 
 
 def require_dict(value: Any, field: str) -> dict[str, Any]:
@@ -156,6 +185,36 @@ def apply_replacements(code: str, replacements: Any) -> tuple[str, list[dict[str
     return result, applied
 
 
+def allowed_roots_from_env() -> list[Path]:
+    raw = os.environ.get("ARCHSMITH_ALLOWED_ROOTS")
+    if not raw:
+        return []
+    parts = [part.strip() for part in raw.split(";") if part.strip()]
+    roots: list[Path] = []
+    for part in parts:
+        roots.append(Path(part).expanduser().resolve())
+    return roots
+
+
+def ensure_allowed_path(path: Path) -> None:
+    roots = allowed_roots_from_env()
+    if not roots:
+        return
+    resolved = path.expanduser().resolve()
+    for root in roots:
+        try:
+            if os.path.commonpath([str(resolved), str(root)]) == str(root):
+                return
+        except ValueError:
+            continue
+    raise ValidationError(
+        "target path is outside ARCHSMITH_ALLOWED_ROOTS",
+        error_code="PATH_BLOCKED",
+        retry_with={"destination_path": str(roots[0]) if roots else None},
+        details={"path": str(resolved), "allowed_roots": [str(root) for root in roots]},
+    )
+
+
 class ArchSmithStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = (root or default_home()).expanduser()
@@ -166,6 +225,7 @@ class ArchSmithStore:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self._fts_supported_cache: bool | None = None
         self._migrate()
 
     def close(self) -> None:
@@ -465,12 +525,24 @@ class ArchSmithStore:
             WHERE {' AND '.join(where)}
             ORDER BY r.approved_at DESC, r.id DESC
         """
-        results: list[dict[str, Any]] = []
+        rows = list(self.conn.execute(sql, params))
+        row_documents: list[str] = []
+        unique_rows: list[sqlite3.Row] = []
         seen: set[int] = set()
-        for row in self.conn.execute(sql, params):
+        for row in rows:
             if row["function_id"] in seen:
                 continue
             seen.add(row["function_id"])
+            payload = self._revision_payload(row, include_code=False)
+            tags = {str(tag).lower() for tag in payload.get("tags") or []}
+            if tags_filter and not tags_filter.issubset(tags):
+                continue
+            unique_rows.append(row)
+            row_documents.append(self._metadata_search_text(payload))
+
+        fts_matches = self._fts_match_indexes(row_documents, terms)
+        results: list[dict[str, Any]] = []
+        for index, row in enumerate(unique_rows):
             payload = self._revision_payload(row, include_code=False)
             searchable = " ".join(
                 str(part or "")
@@ -481,18 +553,150 @@ class ArchSmithStore:
                     payload.get("runtime"),
                     payload.get("signature"),
                     " ".join(payload.get("tags") or []),
+                    payload["context"]["user"],
+                    payload["context"]["profile"],
+                    payload["context"]["knowledge"],
+                    payload["context"]["module"],
                 )
             ).lower()
-            score = 1.0 if not terms else sum(1 for term in terms if term in searchable) / len(terms)
+            reasons: list[str] = []
+            if terms:
+                term_hits = sum(1 for term in terms if term in searchable)
+                score = term_hits / len(terms)
+                if term_hits:
+                    reasons.append("term_match")
+                if index in fts_matches:
+                    score = min(1.0, score + 0.20)
+                    reasons.append("fts_match")
+            else:
+                score = 1.0
+                reasons.append("no_query")
+            tags = {str(tag).lower() for tag in payload.get("tags") or []}
+            if tags_filter:
+                tag_score = len(tags_filter.intersection(tags)) / len(tags_filter)
+                score = min(1.0, score + (0.15 * tag_score))
+                reasons.append("tag_filter")
+            if language:
+                reasons.append("language_filter")
             if terms and score == 0:
                 continue
-            tags = {str(tag).lower() for tag in payload.get("tags") or []}
-            if tags_filter and not tags_filter.issubset(tags):
-                continue
             payload["score"] = round(score, 6)
+            payload["score_reasons"] = reasons
             results.append(payload if detail else self._compact_revision_payload(payload))
         results.sort(key=lambda item: (item["score"], item.get("approved_at") or ""), reverse=True)
         return {"functions": results[:limit], "count": min(len(results), limit)}
+
+    def recommend_reuse(self, data: dict[str, Any]) -> dict[str, Any]:
+        task = str(data.get("task") or "").strip()
+        if not task:
+            raise ValidationError("task is required")
+        limit = max(1, min(int(data.get("limit") or 5), 25))
+        desired = [str(value).strip() for value in (data.get("desired_functions") or []) if str(value).strip()]
+        query = " ".join([task, *desired])
+        search = self.search_functions(
+            {
+                "context": data.get("context") if isinstance(data.get("context"), dict) else data,
+                "query": query,
+                "language": data.get("language"),
+                "tags": data.get("tags") or [],
+                "limit": max(limit * 3, 10),
+                "detail": True,
+            }
+        )
+        task_terms = {term for term in re.split(r"\W+", query.lower()) if term}
+        desired_slugs = {slugify(value, "desired_functions") for value in desired} if desired else set()
+        context_filter = data.get("context") if isinstance(data.get("context"), dict) else data
+        scored: list[dict[str, Any]] = []
+        for payload in search["functions"]:
+            reasons: list[str] = list(payload.get("score_reasons") or [])
+            score = 0.0
+            name_slug = slugify(payload["name"], "name")
+            name_terms = {term for term in re.split(r"\W+", payload["name"].lower()) if term}
+            metadata_terms = {
+                term
+                for term in re.split(
+                    r"\W+",
+                    self._metadata_search_text(payload),
+                )
+                if term
+            }
+            if name_slug in desired_slugs or payload["name"].lower() in query.lower() or name_slug in query.lower().replace("_", "-"):
+                score += 0.45
+                reasons.append("exact_name")
+            elif task_terms.intersection(name_terms):
+                score += 0.24
+                reasons.append("name_terms")
+            if task_terms:
+                overlap = len(task_terms.intersection(metadata_terms)) / len(task_terms)
+                if overlap:
+                    score += min(0.25, 0.25 * overlap)
+                    reasons.append("metadata_terms")
+            context_score = self._context_match_score(payload["context"], context_filter)
+            if context_score:
+                score += 0.18 * context_score
+                reasons.append("context_match")
+            if data.get("language") and str(data.get("language")).lower() == str(payload.get("language")).lower():
+                score += 0.08
+                reasons.append("language_match")
+            requested_tags = {str(tag).lower() for tag in (data.get("tags") or [])}
+            payload_tags = {str(tag).lower() for tag in (payload.get("tags") or [])}
+            if requested_tags:
+                tag_overlap = len(requested_tags.intersection(payload_tags)) / len(requested_tags)
+                if tag_overlap:
+                    score += 0.12 * tag_overlap
+                    reasons.append("tags_match")
+            stats = self._reuse_stats(int(payload["revision_id"]))
+            if stats["reuse_count"]:
+                score += min(0.05, stats["reuse_count"] * 0.01)
+                reasons.append("reuse_history")
+            if payload.get("approved_at"):
+                score += 0.03
+                reasons.append("approved")
+            candidate = {
+                "name": payload["name"],
+                "function_id": payload["function_id"],
+                "revision_id": payload["revision_id"],
+                "score": round(min(score, 1.0), 6),
+                "reasons": sorted(set(reasons)),
+                "context": payload["context"],
+                "signature": payload.get("signature"),
+                "tags": payload.get("tags") or [],
+                "public_version": payload["public_version"],
+                "reuse_count": stats["reuse_count"],
+                "last_reused_at": stats["last_reused_at"],
+            }
+            if candidate["score"] > 0:
+                scored.append(candidate)
+        scored.sort(key=lambda item: (item["score"], item["reuse_count"], item["revision_id"]), reverse=True)
+        candidates = scored[:limit]
+        if not candidates:
+            return {"status": "not_found", "candidates": [], "suggested_action": "propose_new"}
+
+        top = candidates[0]
+        second_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
+        has_context_filter = any((context_filter.get(field) if isinstance(context_filter, dict) else None) for field in ("user", "profile", "knowledge", "module"))
+        distinct_contexts = {
+            (
+                item["context"].get("user"),
+                item["context"].get("profile"),
+                item["context"].get("knowledge"),
+                item["context"].get("module"),
+            )
+            for item in candidates
+        }
+        if not has_context_filter and len(distinct_contexts) > 1 and top["score"] < 0.90:
+            status = "needs_context"
+            suggested_action = "ask_user"
+        elif top["score"] >= 0.75 and top["score"] - second_score >= 0.15:
+            status = "ready"
+            suggested_action = "materialize_project" if len(desired) > 1 else "materialize_by_name"
+        elif len(candidates) > 1:
+            status = "ambiguous"
+            suggested_action = "ask_user"
+        else:
+            status = "not_found" if top["score"] < 0.35 else "ambiguous"
+            suggested_action = "propose_new" if status == "not_found" else "search_more"
+        return {"status": status, "candidates": candidates, "suggested_action": suggested_action}
 
     def get_function(self, data: dict[str, Any]) -> dict[str, Any]:
         include_code = bool(data.get("include_code"))
@@ -500,8 +704,9 @@ class ArchSmithStore:
         return self._revision_payload(revision, include_code=include_code)
 
     def materialize_function(self, data: dict[str, Any]) -> dict[str, Any]:
-        if not data.get("confirm_write"):
-            raise ValidationError("confirm_write must be true")
+        dry_run = bool(data.get("dry_run"))
+        if not data.get("confirm_write") and not dry_run:
+            raise ValidationError("confirm_write must be true", error_code="APPROVAL_REQUIRED")
         revision = self._select_revision(data, approved_only=True)
         source = self.root / revision["code_path"]
         if not source.exists():
@@ -528,18 +733,25 @@ class ArchSmithStore:
         try:
             common = os.path.commonpath([str(target), str(target_dir)])
         except ValueError as exc:
-            raise ValidationError("target path is outside destination") from exc
+            raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED") from exc
         if common != str(target_dir):
-            raise ValidationError("target path is outside destination")
+            raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED")
+        ensure_allowed_path(target)
         if target.exists() and not data.get("overwrite"):
-            raise ValidationError("target exists and overwrite is false")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            if not dry_run:
+                raise ValidationError("target exists and overwrite is false", error_code="TARGET_EXISTS")
         payload = {
             "revision_id": revision["id"],
             "function_id": revision["function_id"],
             "path": str(target),
         }
+        if dry_run:
+            payload["dry_run"] = True
+            payload["would_write"] = str(target)
+            payload["target_exists"] = target.exists()
+        else:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
         if data.get("include_hash"):
             payload["code_hash"] = revision["code_hash"]
         return payload
@@ -556,6 +768,7 @@ class ArchSmithStore:
                 "filename": data.get("filename"),
                 "overwrite": data.get("overwrite"),
                 "confirm_write": data.get("confirm_write"),
+                "dry_run": data.get("dry_run"),
             }
         )
         payload = {
@@ -566,9 +779,13 @@ class ArchSmithStore:
             "public_version": revision["public_version"],
             "revision": revision["revision"],
         }
+        if materialized.get("dry_run"):
+            payload["dry_run"] = True
+            payload["would_write"] = materialized.get("would_write")
+            payload["target_exists"] = materialized.get("target_exists")
         if data.get("include_hash"):
             payload["code_hash"] = revision["code_hash"]
-        if data.get("record_reuse", True):
+        if data.get("record_reuse", True) and not materialized.get("dry_run"):
             try:
                 reuse = self.record_reuse(
                     {
@@ -593,16 +810,25 @@ class ArchSmithStore:
     def materialize_project(self, data: dict[str, Any]) -> dict[str, Any]:
         plans = self._plan_project_materialization(data, include_memory=False)
         if not data.get("confirm_write"):
-            raise ValidationError("confirm_write must be true")
+            raise ValidationError("confirm_write must be true", error_code="APPROVAL_REQUIRED")
         target_root = plans["target_root"]
         blocked = plans["blocked"]
         if blocked:
-            raise ValidationError("adaptation exceeds mutation threshold: " + json.dumps(blocked, ensure_ascii=False))
+            raise ValidationError(
+                "adaptation exceeds mutation threshold",
+                error_code="DIFF_TOO_LARGE",
+                candidates=blocked,
+                details={"mutation_threshold": MUTATION_THRESHOLD},
+            )
         overwrite = bool(data.get("overwrite"))
         for item in plans["items"]:
             target = item["target"]
             if target.exists() and not overwrite:
-                raise ValidationError("target exists and overwrite is false")
+                raise ValidationError(
+                    "target exists and overwrite is false",
+                    error_code="TARGET_EXISTS",
+                    details={"path": str(target)},
+                )
         target_root.mkdir(parents=True, exist_ok=True)
         files: list[dict[str, Any]] = []
         for item in plans["items"]:
@@ -639,6 +865,33 @@ class ArchSmithStore:
                     }
             files.append(file_payload)
         return {"project_path": str(target_root), "count": len(files), "files": files}
+
+    def plan_project(self, data: dict[str, Any]) -> dict[str, Any]:
+        plans = self._plan_project_materialization(data, include_memory=True)
+        estimate = self._estimate_project_from_plans(plans)
+        files: list[dict[str, Any]] = []
+        for item in plans["items"]:
+            files.append(
+                {
+                    "name": item["name"],
+                    "filename": item["filename"],
+                    "path": str(item["target"]),
+                    "function_id": item["function_id"],
+                    "revision_id": item["revision_id"],
+                    "public_version": item["public_version"],
+                    "revision": item["revision"],
+                    "diff_ratio": item["diff_ratio"],
+                    "replacements": item["replacements"],
+                }
+            )
+        return {
+            "project_path": str(plans["target_root"]),
+            "count": len(files),
+            "files": files,
+            "blocked": plans["blocked"],
+            "can_materialize": not bool(plans["blocked"]),
+            "token_estimate": estimate,
+        }
 
     def record_reuse(self, data: dict[str, Any]) -> dict[str, Any]:
         revision = self._select_revision(data, approved_only=True)
@@ -743,7 +996,15 @@ class ArchSmithStore:
         plans = self._plan_project_materialization(data, include_memory=True)
         blocked = plans["blocked"]
         if blocked:
-            raise ValidationError("adaptation exceeds mutation threshold: " + json.dumps(blocked, ensure_ascii=False))
+            raise ValidationError(
+                "adaptation exceeds mutation threshold",
+                error_code="DIFF_TOO_LARGE",
+                candidates=blocked,
+                details={"mutation_threshold": MUTATION_THRESHOLD},
+            )
+        return self._estimate_project_from_plans(plans)
+
+    def _estimate_project_from_plans(self, plans: dict[str, Any]) -> dict[str, Any]:
         target_root = plans["target_root"]
         direct_call = json.dumps(
             {
@@ -843,6 +1104,75 @@ class ArchSmithStore:
         self.conn.commit()
         return {"deprecated": count}
 
+    def _metadata_search_text(self, payload: dict[str, Any]) -> str:
+        context = payload.get("context") or {}
+        parts = [
+            payload.get("name"),
+            payload.get("summary"),
+            payload.get("signature"),
+            payload.get("language"),
+            payload.get("runtime"),
+            " ".join(str(tag) for tag in (payload.get("tags") or [])),
+            context.get("user"),
+            context.get("profile"),
+            context.get("knowledge"),
+            context.get("module"),
+        ]
+        return " ".join(str(part or "") for part in parts).lower()
+
+    def _fts_supported(self) -> bool:
+        if os.environ.get("ARCHSMITH_DISABLE_FTS"):
+            return False
+        if self._fts_supported_cache is not None:
+            return self._fts_supported_cache
+        try:
+            self.conn.execute("CREATE VIRTUAL TABLE temp.archsmith_fts_probe USING fts5(value)")
+            self.conn.execute("DROP TABLE temp.archsmith_fts_probe")
+            self._fts_supported_cache = True
+        except sqlite3.OperationalError:
+            self._fts_supported_cache = False
+        return self._fts_supported_cache
+
+    def _fts_match_indexes(self, documents: list[str], terms: list[str]) -> set[int]:
+        if not documents or not terms or not self._fts_supported():
+            return set()
+        safe_terms = [term for term in terms if re.match(r"^[A-Za-z0-9_]+$", term)]
+        if not safe_terms:
+            return set()
+        query = " OR ".join(f"{term}*" for term in safe_terms)
+        try:
+            self.conn.execute("DROP TABLE IF EXISTS temp.archsmith_search_fts")
+            self.conn.execute("CREATE VIRTUAL TABLE temp.archsmith_search_fts USING fts5(value)")
+            self.conn.executemany("INSERT INTO temp.archsmith_search_fts(value) VALUES (?)", [(document,) for document in documents])
+            rows = self.conn.execute("SELECT rowid FROM temp.archsmith_search_fts WHERE value MATCH ?", (query,)).fetchall()
+            return {int(row["rowid"]) - 1 for row in rows}
+        except sqlite3.OperationalError:
+            return set()
+        finally:
+            try:
+                self.conn.execute("DROP TABLE IF EXISTS temp.archsmith_search_fts")
+            except sqlite3.OperationalError:
+                pass
+
+    def _context_match_score(self, context: dict[str, Any], context_filter: dict[str, Any] | None) -> float:
+        if not isinstance(context_filter, dict):
+            return 0.0
+        requested = {field: context_filter.get(field) for field in ("user", "profile", "knowledge", "module") if context_filter.get(field)}
+        if not requested:
+            return 0.0
+        matches = 0
+        for field, value in requested.items():
+            if slugify(str(context.get(field) or ""), field) == slugify(str(value), field):
+                matches += 1
+        return matches / len(requested)
+
+    def _reuse_stats(self, revision_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT count(*) AS reuse_count, max(created_at) AS last_reused_at FROM reuse_logs WHERE revision_id = ?",
+            (revision_id,),
+        ).fetchone()
+        return {"reuse_count": int(row["reuse_count"] or 0), "last_reused_at": row["last_reused_at"]}
+
     def _plan_project_materialization(self, data: dict[str, Any], include_memory: bool) -> dict[str, Any]:
         destination_value = data.get("destination_path")
         if not isinstance(destination_value, str) or not destination_value.strip():
@@ -850,6 +1180,7 @@ class ArchSmithStore:
         target_root = Path(destination_value).expanduser().resolve()
         if target_root.suffix:
             raise ValidationError("destination_path must be a directory for project materialization")
+        ensure_allowed_path(target_root)
         functions = data.get("functions")
         if not isinstance(functions, list) or not functions:
             raise ValidationError("functions must be a non-empty array")
@@ -901,9 +1232,10 @@ class ArchSmithStore:
             try:
                 common = os.path.commonpath([str(target), str(target_root)])
             except ValueError as exc:
-                raise ValidationError("target path is outside destination") from exc
+                raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED") from exc
             if common != str(target_root):
-                raise ValidationError("target path is outside destination")
+                raise ValidationError("target path is outside destination", error_code="PATH_BLOCKED")
+            ensure_allowed_path(target)
             payload = self._revision_payload(revision, include_code=False)
             memory = None
             if include_memory:
@@ -1002,7 +1334,10 @@ class ArchSmithStore:
             if result["count"] == 1:
                 return self._revision_by_id(int(result["functions"][0]["revision_id"]))
         if not rows:
-            raise NotFoundError("approved function was not found")
+            raise NotFoundError(
+                "approved function was not found",
+                retry_with={"name": name, "context": context_filter if isinstance(context_filter, dict) else {}},
+            )
         latest_by_function: dict[int, sqlite3.Row] = {}
         for row in rows:
             latest_by_function.setdefault(int(row["function_id"]), row)
@@ -1021,7 +1356,12 @@ class ArchSmithStore:
                 }
                 for row in latest_by_function.values()
             ]
-            raise ValidationError("function name is ambiguous: " + json.dumps(candidates, ensure_ascii=False))
+            raise ValidationError(
+                "function name is ambiguous",
+                error_code="AMBIGUOUS_FUNCTION",
+                retry_with={"context": {"profile": "<profile>", "knowledge": "<knowledge>", "module": "<module>"}},
+                candidates=candidates,
+            )
         return next(iter(latest_by_function.values()))
 
     def _write_code(self, function_id: int, function_slug: str, public_version: int, revision: int, language: str, code: str) -> str:
@@ -1129,6 +1469,58 @@ class ArchSmithStore:
             return None
         return path.read_text(encoding="utf-8")
 
+    def approved_functions_metadata(self, limit: int = 200) -> dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT r.*, f.name AS function_name, f.slug AS function_slug,
+                   c.user_name, c.profile_name, c.knowledge_name, c.module_name,
+                   c.user_slug, c.profile_slug, c.knowledge_slug, c.module_slug
+            FROM revisions r
+            JOIN functions f ON f.id = r.function_id
+            JOIN contexts c ON c.id = f.context_id
+            WHERE r.status = 'approved'
+            ORDER BY r.approved_at DESC, r.id DESC
+            """
+        ).fetchall()
+        seen: set[int] = set()
+        functions: list[dict[str, Any]] = []
+        for row in rows:
+            if row["function_id"] in seen:
+                continue
+            seen.add(row["function_id"])
+            payload = self._compact_revision_payload(self._revision_payload(row, include_code=False))
+            stats = self._reuse_stats(int(row["id"]))
+            payload["reuse_count"] = stats["reuse_count"]
+            payload["last_reused_at"] = stats["last_reused_at"]
+            functions.append(payload)
+            if len(functions) >= limit:
+                break
+        return {"functions": functions, "count": len(functions)}
+
+    def function_metadata(self, function_id: int) -> dict[str, Any]:
+        function = self._function_by_id(function_id)
+        row = self.conn.execute(
+            """
+            SELECT r.*, f.name AS function_name, f.slug AS function_slug,
+                   c.user_name, c.profile_name, c.knowledge_name, c.module_name,
+                   c.user_slug, c.profile_slug, c.knowledge_slug, c.module_slug
+            FROM revisions r
+            JOIN functions f ON f.id = r.function_id
+            JOIN contexts c ON c.id = f.context_id
+            WHERE r.function_id = ? AND r.status = 'approved'
+            ORDER BY r.public_version DESC, r.revision DESC, r.id DESC
+            LIMIT 1
+            """,
+            (function["id"],),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("approved function metadata was not found")
+        payload = self._revision_payload(row, include_code=False)
+        stats = self._reuse_stats(int(row["id"]))
+        payload["reuse_count"] = stats["reuse_count"]
+        payload["last_reused_at"] = stats["last_reused_at"]
+        return payload
+
     def _select_revision(self, data: dict[str, Any], approved_only: bool) -> sqlite3.Row:
         revision_id = data.get("revision_id")
         if revision_id:
@@ -1151,7 +1543,7 @@ class ArchSmithStore:
                 raise NotFoundError("revision not found")
             revision = self._revision_by_id(int(row["id"]))
         if approved_only and revision["status"] != "approved":
-            raise ValidationError("approved revision is required")
+            raise ValidationError("approved revision is required", error_code="APPROVAL_REQUIRED")
         return revision
 
     def _revision_payload(self, row: sqlite3.Row, include_code: bool) -> dict[str, Any]:

@@ -43,12 +43,17 @@ This makes ArchSmith closer to a local catalog of approved building blocks than 
 - A stdio MCP server named `archsmith-mcp`.
 - A Codex plugin named `archsmith` with the `memory` skill.
 - Low-token tools for direct reuse:
+  - `archsmith_recommend_reuse`
   - `archsmith_materialize_by_name`
+  - `archsmith_plan_project`
   - `archsmith_materialize_project`
   - `archsmith_estimate_savings`
   - `archsmith_estimate_project_savings`
+- MCP prompts for common reuse, recommendation, project creation, and approval workflows.
+- Metadata-only MCP resources for contexts and approved functions.
 - Approval-first versioning for reusable code.
 - Local path validation and path traversal protection.
+- Optional `ARCHSMITH_ALLOWED_ROOTS` enforcement for materialization destinations.
 - Secret-like content rejection for obvious passwords, tokens, cookies, private keys, and full connection strings.
 
 ArchSmith ships with no preloaded memory, no sample database, and no bundled project data.
@@ -63,6 +68,11 @@ ArchSmith ships with no preloaded memory, no sample database, and no bundled pro
 ### Standalone MCP
 
 Clone the repository and point your MCP client at the server:
+
+```bash
+git clone https://github.com/HendrylHH/archsmith.git
+cd archsmith
+```
 
 ```json
 {
@@ -145,6 +155,15 @@ Then start a new Codex thread so the MCP tools and skill metadata are loaded fre
 
 If your client does not expose MCP tools in a session, use the bundled CLI.
 
+Recommend approved functions for a task:
+
+```bash
+python plugins/archsmith/mcp/cli.py recommend \
+  --task "Create a billing import script from approved functions" \
+  --profile "Company X" \
+  --knowledge "Project 123"
+```
+
 Materialize one approved function:
 
 ```bash
@@ -156,6 +175,15 @@ python plugins/archsmith/mcp/cli.py materialize function_name \
   --client codex
 ```
 
+Dry-run one approved function without writing:
+
+```bash
+python plugins/archsmith/mcp/cli.py materialize function_name \
+  --destination /path/to/project \
+  --dry-run \
+  --minimal
+```
+
 Estimate savings for one approved function:
 
 ```bash
@@ -164,6 +192,13 @@ python plugins/archsmith/mcp/cli.py estimate function_name \
 ```
 
 Create a project from multiple approved functions:
+
+```bash
+python plugins/archsmith/mcp/cli.py plan-project \
+  --spec /path/to/project-spec.json
+```
+
+Then materialize after review:
 
 ```bash
 python plugins/archsmith/mcp/cli.py project \
@@ -185,11 +220,26 @@ python plugins/archsmith/mcp/cli.py estimate-project \
 
 Use prompts like these with an MCP-enabled coding agent:
 
+- "Use ArchSmith to recommend which approved functions should be reused for a new billing reconciliation script in Company X / Project 123. Show the candidates and reasons only, no stored code."
 - "Use ArchSmith to create a new script with the saved functions `load_company_settings`, `normalize_customer_record`, and `write_project_report` from Project 123 at Company X. Change the company label from `Company X` to `Company Y` in the generated script only."
 - "Use ArchSmith to materialize the approved function `parse_billing_csv` from Company X's Billing Toolkit into this project. Record reuse and do not print the stored code in chat."
 - "Create a new project from the cataloged ArchSmith functions `read_job_manifest`, `prepare_output_dir`, `build_batch_summary`, `write_json_artifact`, and `format_status_line` for Company X. Change the output folder constant from `output` to `artifacts`."
 - "Search ArchSmith for approved Python functions in Company X / Project 123 related to reporting. Show summaries and signatures only; load code only after I choose one."
 - "Propose the current implementation as a reusable ArchSmith function under User X / Company X / Project 123 / reporting, but wait for my approval before marking it approved."
+
+## How Reuse Is Chosen
+
+ArchSmith is most useful for people and teams that already know their recurring work and decide what deserves to be saved for reuse. The MCP does not crawl your codebase or magically infer every abstraction. You or your team curate approved functions, attach metadata, and approve revisions.
+
+When the next task arrives, `archsmith_recommend_reuse` helps the agent choose candidates by looking at approved metadata only:
+
+- exact function name or slug matches;
+- context matches such as user, company/profile, project/knowledge, and module;
+- language and tag matches;
+- task terms found in names, summaries, signatures, tags, and context names;
+- approval recency and reuse history.
+
+The recommendation tool returns `ready`, `ambiguous`, `needs_context`, or `not_found`. It also returns reasons and the next action, but never returns stored code. If context is too broad, the agent should ask the user which company, project, module, or function was intended.
 
 ## Project Spec
 
@@ -267,6 +317,13 @@ The larger the approved function is, and the more often it is reused, the more A
 
 ## Recommended Agent Workflow
 
+For an open-ended reuse request:
+
+1. Call `archsmith_recommend_reuse` with the task, known context, language, tags, and desired function names if the user supplied them.
+2. If the result is `ready`, follow `suggested_action`.
+3. If the result is `ambiguous` or `needs_context`, ask the user for the missing context instead of guessing.
+4. If the result is `not_found`, propose a new function only after confirming the existing catalog does not cover the task.
+
 For a simple reuse request:
 
 1. Call `archsmith_materialize_by_name`.
@@ -275,10 +332,11 @@ For a simple reuse request:
 
 For a project request:
 
-1. Call `archsmith_materialize_project`.
-2. Provide a destination and the list of approved function names.
-3. Use `replacements` only for small project-specific changes.
-4. If ArchSmith reports a diff above `20%`, propose a new function version and ask for approval.
+1. Call `archsmith_plan_project`.
+2. Review planned files, candidate revision IDs, replacement diff ratios, blocked items, and token estimate.
+3. Call `archsmith_materialize_project` only after the plan is acceptable and writing is approved.
+4. Use `replacements` only for small project-specific changes.
+5. If ArchSmith reports a diff above `20%`, propose a new function version and ask for approval.
 
 For token accounting:
 
@@ -291,6 +349,7 @@ For token accounting:
 - ArchSmith is local-first and offline by design.
 - The MCP server does not make network calls.
 - Stored code and metadata remain under the local data directory unless the user materializes them into a project.
+- If `ARCHSMITH_ALLOWED_ROOTS` is set, materialization is allowed only inside one of those semicolon-separated roots.
 - ArchSmith rejects common secret-like assignments and private key blocks.
 - Do not store passwords, cookies, tokens, private keys, or full connection strings.
 - Store environment variable names, preconditions, dependencies, and operational notes instead.
@@ -309,8 +368,13 @@ The tests cover:
 - Function approval and search without code by default.
 - Named materialization.
 - Project materialization with minor replacements.
+- Project planning without writing files.
 - Project-level token estimates.
+- Reuse recommendation states and ranking.
+- SQLite FTS5 search and fallback search.
 - The `20%` mutation threshold.
+- Structured MCP tool errors.
 - Path traversal blocking.
-- stdio MCP `tools/list` and `tools/call`.
+- `ARCHSMITH_ALLOWED_ROOTS` write restrictions.
+- stdio MCP `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, and `resources/read`.
 - CLI materialization, reuse logging, and estimates.

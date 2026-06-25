@@ -19,7 +19,18 @@ def compact(value: Any) -> str:
 
 
 def minimal_result(value: dict[str, Any]) -> dict[str, Any]:
-    fields = ("path", "function_id", "revision_id", "reuse_log_id", "reuse_recorded", "reuse_error", "reuse_retry")
+    fields = (
+        "path",
+        "function_id",
+        "revision_id",
+        "dry_run",
+        "would_write",
+        "target_exists",
+        "reuse_log_id",
+        "reuse_recorded",
+        "reuse_error",
+        "reuse_retry",
+    )
     return {field: value[field] for field in fields if field in value}
 
 
@@ -56,14 +67,15 @@ def materialize(args: argparse.Namespace) -> dict[str, Any]:
     name = args.name or args.positional_name
     if not name:
         raise ArchSmithError("name is required")
-    if not args.confirm_write:
+    if not args.confirm_write and not args.dry_run:
         raise ArchSmithError("--confirm-write is required")
     data: dict[str, Any] = {
         "name": name,
         "destination_path": args.dest,
         "filename": args.filename,
         "overwrite": args.overwrite,
-        "confirm_write": True,
+        "confirm_write": args.confirm_write,
+        "dry_run": args.dry_run,
         "record_reuse": args.record_reuse or not args.no_record_reuse,
         "project_path": args.project_path or args.dest,
         "client": args.client,
@@ -88,6 +100,33 @@ def materialize(args: argparse.Namespace) -> dict[str, Any]:
     store = ArchSmithStore()
     try:
         return store.materialize_by_name(data)
+    finally:
+        store.close()
+
+
+def recommend(args: argparse.Namespace) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "task": args.task,
+        "language": args.language,
+        "tags": args.tags or [],
+        "desired_functions": args.function or [],
+        "limit": args.limit,
+    }
+    context = {
+        key: value
+        for key, value in {
+            "user": args.user,
+            "profile": args.profile,
+            "knowledge": args.knowledge,
+            "module": args.module,
+        }.items()
+        if value
+    }
+    if context:
+        data["context"] = context
+    store = ArchSmithStore()
+    try:
+        return store.recommend_reuse(data)
     finally:
         store.close()
 
@@ -157,6 +196,17 @@ def project(args: argparse.Namespace) -> dict[str, Any]:
         store.close()
 
 
+def plan_project(args: argparse.Namespace) -> dict[str, Any]:
+    data = load_spec(args.spec)
+    if args.dest:
+        data["destination_path"] = args.dest
+    store = ArchSmithStore()
+    try:
+        return store.plan_project(data)
+    finally:
+        store.close()
+
+
 def estimate_project(args: argparse.Namespace) -> dict[str, Any]:
     data = load_spec(args.spec)
     if args.dest:
@@ -179,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     materialize_parser.add_argument("--filename")
     materialize_parser.add_argument("--overwrite", action="store_true")
     materialize_parser.add_argument("--confirm-write", action="store_true")
+    materialize_parser.add_argument("--dry-run", action="store_true")
     materialize_parser.add_argument("--record-reuse", action="store_true")
     materialize_parser.add_argument("--no-record-reuse", action="store_true")
     materialize_parser.add_argument("--minimal", action="store_true")
@@ -188,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
     materialize_parser.add_argument("--notes")
     materialize_parser.add_argument("--allow-fuzzy", action="store_true")
     add_context_flags(materialize_parser)
+
+    recommend_parser = subparsers.add_parser("recommend")
+    recommend_parser.add_argument("--task", required=True)
+    recommend_parser.add_argument("--function", action="append")
+    recommend_parser.add_argument("--limit", type=int, default=5)
+    add_context_flags(recommend_parser)
 
     reuse_parser = subparsers.add_parser("reuse")
     reuse_parser.add_argument("--revision-id", type=int)
@@ -213,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     project_parser.add_argument("--client")
     project_parser.add_argument("--notes")
 
+    plan_project_parser = subparsers.add_parser("plan-project")
+    plan_project_parser.add_argument("--spec", required=True)
+    plan_project_parser.add_argument("--dest", "--destination", dest="dest")
+
     estimate_project_parser = subparsers.add_parser("estimate-project")
     estimate_project_parser.add_argument("--spec", required=True)
     estimate_project_parser.add_argument("--dest", "--destination", dest="dest")
@@ -223,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             result = materialize(args)
             if args.minimal:
                 result = minimal_result(result)
+        elif args.command == "recommend":
+            result = recommend(args)
         elif args.command == "reuse":
             result = reuse(args)
         elif args.command == "estimate":
@@ -231,12 +294,14 @@ def main(argv: list[str] | None = None) -> int:
             result = project(args)
             if args.minimal:
                 result = minimal_project_result(result)
+        elif args.command == "plan-project":
+            result = plan_project(args)
         elif args.command == "estimate-project":
             result = estimate_project(args)
         else:
             parser.error("unknown command")
     except ArchSmithError as exc:
-        print(compact({"error": str(exc)}), file=sys.stderr)
+        print(compact(exc.payload()), file=sys.stderr)
         return 2
     print(compact(result))
     return 0

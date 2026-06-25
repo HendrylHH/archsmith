@@ -1,7 +1,7 @@
 {
   "name": "archsmith",
-  "version": "0.1.0+codex.20260624144837",
-  "description": "Local engineering memory for approved reusable project functions.",
+  "version": "0.2.0+codex.20260625000000",
+  "description": "Local approved engineering memory with reuse recommendation and safe materialization.",
   "author": {
     "name": "ArchSmith"
   },
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "ArchSmith",
     "shortDescription": "Reuse approved local engineering functions.",
-    "longDescription": "ArchSmith provides a local MCP-backed memory for approved reusable project functions, recipes, metadata, and reuse history.",
+    "longDescription": "ArchSmith provides local MCP-backed memory for approved reusable project functions, metadata, recommendation, planning, materialization, version history, and reuse logs.",
     "developerName": "ArchSmith",
     "category": "Productivity",
     "capabilities": [

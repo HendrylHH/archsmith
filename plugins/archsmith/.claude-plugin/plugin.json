@@ -1,7 +1,7 @@
 {
   "name": "archsmith",
   "displayName": "ArchSmith",
-  "description": "Local-first approved engineering memory with reusable functions and a bundled MCP server.",
+  "description": "Local-first approved engineering memory with reuse recommendation, planning, safe materialization, and a bundled MCP server.",
   "author": {
     "name": "ArchSmith"
   },

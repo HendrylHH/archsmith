@@ -45,6 +45,26 @@ class StoreCase(unittest.TestCase):
             }
         )
 
+    def propose_in_context(
+        self,
+        context: dict[str, str],
+        name: str,
+        summary: str,
+        code: str = "def saved_fn():\n    return 1\n",
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        return self.store.propose_function(
+            {
+                "context": context,
+                "name": name,
+                "summary": summary,
+                "language": "python",
+                "code": code,
+                "signature": f"{name}()",
+                "tags": tags or [],
+            }
+        )
+
     def test_context_and_search_hide_code_by_default(self) -> None:
         self.store.upsert_context(self.context())
         proposal = self.propose("def fn():\n    return 1\n")
@@ -116,6 +136,88 @@ class StoreCase(unittest.TestCase):
         self.assertGreater(result["without_archsmith"]["total"], result["with_archsmith"]["total"])
         self.assertNotIn("code", json.dumps(result))
 
+    def test_recommend_reuse_exact_match_without_code(self) -> None:
+        proposal = self.propose_in_context(
+            self.context(),
+            "invoice_export_csv",
+            "export invoices to csv with approved formatting",
+            tags=["billing", "csv"],
+        )
+        self.store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
+        self.store.record_reuse({"revision_id": proposal["revision_id"], "project_path": str(self.root), "client": "test"})
+        result = self.store.recommend_reuse(
+            {
+                "task": "Create a script with invoice_export_csv",
+                "context": self.context(),
+                "desired_functions": ["invoice_export_csv"],
+                "language": "python",
+                "tags": ["csv"],
+            }
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["suggested_action"], "materialize_by_name")
+        self.assertEqual(result["candidates"][0]["name"], "invoice_export_csv")
+        self.assertGreaterEqual(result["candidates"][0]["reuse_count"], 1)
+        self.assertNotIn("code", json.dumps(result))
+
+    def test_recommend_reuse_needs_context_when_name_spans_contexts(self) -> None:
+        first_context = {"user": "team", "profile": "acme", "knowledge": "portal", "module": "auth"}
+        second_context = {"user": "team", "profile": "globex", "knowledge": "portal", "module": "auth"}
+        first = self.propose_in_context(first_context, "portal_login", "login to a web portal")
+        second = self.propose_in_context(second_context, "portal_login", "login to a different web portal")
+        self.store.approve_function({"revision_id": first["revision_id"], "approved_by": "u"})
+        self.store.approve_function({"revision_id": second["revision_id"], "approved_by": "u"})
+        result = self.store.recommend_reuse({"task": "Use portal_login", "desired_functions": ["portal_login"]})
+        self.assertEqual(result["status"], "needs_context")
+        self.assertEqual(result["suggested_action"], "ask_user")
+        self.assertEqual(len(result["candidates"]), 2)
+
+    def test_recommend_reuse_not_found(self) -> None:
+        result = self.store.recommend_reuse({"task": "Create an unrelated geospatial tiling pipeline"})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["suggested_action"], "propose_new")
+
+    def test_recommend_reuse_prefers_exact_context(self) -> None:
+        wanted_context = {"user": "team", "profile": "alpha", "knowledge": "etl", "module": "import"}
+        other_context = {"user": "team", "profile": "beta", "knowledge": "etl", "module": "import"}
+        wanted = self.propose_in_context(wanted_context, "customer_csv_import", "import customer csv rows")
+        other = self.propose_in_context(other_context, "customer_csv_import", "import customer csv rows with a newer variant")
+        self.store.approve_function({"revision_id": other["revision_id"], "approved_by": "u"})
+        self.store.approve_function({"revision_id": wanted["revision_id"], "approved_by": "u"})
+        result = self.store.recommend_reuse(
+            {
+                "task": "Create customer_csv_import",
+                "context": wanted_context,
+                "desired_functions": ["customer_csv_import"],
+            }
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["candidates"][0]["context"]["profile"], "alpha")
+
+    def test_search_uses_fts_when_available_and_fallback_when_disabled(self) -> None:
+        proposal = self.propose_in_context(
+            self.context(),
+            "report_pdf_builder",
+            "build monthly compliance report pdf",
+            tags=["reports", "pdf"],
+        )
+        self.store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
+        result = self.store.search_functions({"query": "compliance pdf", "detail": True})
+        self.assertEqual(result["count"], 1)
+        if self.store._fts_supported():
+            self.assertIn("fts_match", result["functions"][0]["score_reasons"])
+        old = os.environ.get("ARCHSMITH_DISABLE_FTS")
+        os.environ["ARCHSMITH_DISABLE_FTS"] = "1"
+        try:
+            fallback = self.store.search_functions({"query": "compliance pdf", "detail": True})
+        finally:
+            if old is None:
+                os.environ.pop("ARCHSMITH_DISABLE_FTS", None)
+            else:
+                os.environ["ARCHSMITH_DISABLE_FTS"] = old
+        self.assertEqual(fallback["count"], 1)
+        self.assertNotIn('"code":', json.dumps(fallback))
+
     def test_materialize_project_with_minor_replacement_and_estimate(self) -> None:
         code = "\n".join(
             [
@@ -178,7 +280,7 @@ class StoreCase(unittest.TestCase):
             name="blocked_fn",
         )
         self.store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(ValidationError) as raised:
             self.store.materialize_project(
                 {
                     "destination_path": str(self.root / "project"),
@@ -193,6 +295,148 @@ class StoreCase(unittest.TestCase):
                     ],
                 }
             )
+        self.assertEqual(raised.exception.error_code, "DIFF_TOO_LARGE")
+
+    def test_plan_project_reports_blocked_items_without_writing(self) -> None:
+        proposal = self.propose(
+            "def planned_fn():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n",
+            name="planned_fn",
+        )
+        self.store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
+        out_dir = self.root / "planned"
+        result = self.store.plan_project(
+            {
+                "destination_path": str(out_dir),
+                "functions": [
+                    {
+                        "name": "planned_fn",
+                        "filename": "planned_fn.py",
+                        "replacements": {
+                            "def planned_fn():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n": "def planned_fn():\n    return 99\n"
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertFalse(result["can_materialize"])
+        self.assertEqual(result["blocked"][0]["revision_id"], proposal["revision_id"])
+        self.assertIn("token_estimate", result)
+        self.assertFalse((out_dir / "planned_fn.py").exists())
+
+    def test_user_company_project_flow_with_token_estimate(self) -> None:
+        context = {"user": "User X", "profile": "Company X", "knowledge": "Project 123", "module": "automation"}
+        self.store.upsert_context(context)
+        first = self.propose_in_context(
+            context,
+            "load_project_config",
+            "load project configuration from approved environment names",
+            code="\n".join(
+                [
+                    'PROJECT_LABEL = "default"',
+                    "def load_project_config():",
+                    "    config = {}",
+                    "    config['label'] = PROJECT_LABEL",
+                    "    config['enabled'] = True",
+                    "    config['mode'] = 'standard'",
+                    "    config['retries'] = 3",
+                    "    config['timeout'] = 30",
+                    "    config['format'] = 'json'",
+                    "    return config",
+                    "",
+                ]
+            ),
+            tags=["config"],
+        )
+        second = self.propose_in_context(
+            context,
+            "write_status_report",
+            "write a compact status report artifact",
+            code="def write_status_report(config):\n    return f\"status:{config['label']}\"\n",
+            tags=["reporting"],
+        )
+        self.store.approve_function({"revision_id": first["revision_id"], "approved_by": "User X"})
+        self.store.approve_function({"revision_id": second["revision_id"], "approved_by": "User X"})
+        out_dir = self.root / "company-project"
+        plan = self.store.plan_project(
+            {
+                "destination_path": str(out_dir),
+                "context": context,
+                "functions": [
+                    {
+                        "name": "load_project_config",
+                        "filename": "config.py",
+                        "replacements": {'PROJECT_LABEL = "default"': 'PROJECT_LABEL = "tenant-a"'},
+                    },
+                    {"name": "write_status_report", "filename": "report.py"},
+                ],
+            }
+        )
+        self.assertTrue(plan["can_materialize"])
+        self.assertEqual(plan["count"], 2)
+        self.assertGreater(plan["token_estimate"]["without_archsmith"]["total"], plan["token_estimate"]["with_archsmith"]["total"])
+        self.assertNotIn('"code":', json.dumps(plan))
+        materialized = self.store.materialize_project(
+            {
+                "destination_path": str(out_dir),
+                "context": context,
+                "confirm_write": True,
+                "record_reuse": False,
+                "functions": [
+                    {
+                        "name": "load_project_config",
+                        "filename": "config.py",
+                        "replacements": {'PROJECT_LABEL = "default"': 'PROJECT_LABEL = "tenant-a"'},
+                    },
+                    {"name": "write_status_report", "filename": "report.py"},
+                ],
+            }
+        )
+        self.assertEqual(materialized["count"], 2)
+        self.assertTrue((out_dir / "config.py").exists())
+        self.assertTrue((out_dir / "report.py").exists())
+
+    def test_materialize_allowed_roots_and_dry_run(self) -> None:
+        proposal = self.propose("def guarded_fn():\n    return 1\n", name="guarded_fn")
+        self.store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
+        allowed = self.root / "allowed"
+        blocked = self.root / "blocked"
+        old = os.environ.get("ARCHSMITH_ALLOWED_ROOTS")
+        os.environ["ARCHSMITH_ALLOWED_ROOTS"] = str(allowed)
+        try:
+            dry_run = self.store.materialize_by_name(
+                {
+                    "name": "guarded_fn",
+                    "destination_path": str(allowed),
+                    "dry_run": True,
+                    "record_reuse": True,
+                }
+            )
+            self.assertTrue(dry_run["dry_run"])
+            self.assertFalse(Path(dry_run["path"]).exists())
+            written = self.store.materialize_by_name(
+                {
+                    "name": "guarded_fn",
+                    "destination_path": str(allowed),
+                    "confirm_write": True,
+                    "record_reuse": False,
+                }
+            )
+            self.assertTrue(Path(written["path"]).exists())
+            with self.assertRaises(ValidationError) as raised:
+                self.store.materialize_by_name(
+                    {
+                        "name": "guarded_fn",
+                        "destination_path": str(blocked),
+                        "confirm_write": True,
+                        "record_reuse": False,
+                    }
+                )
+            self.assertEqual(raised.exception.error_code, "PATH_BLOCKED")
+        finally:
+            if old is None:
+                os.environ.pop("ARCHSMITH_ALLOWED_ROOTS", None)
+            else:
+                os.environ["ARCHSMITH_ALLOWED_ROOTS"] = old
 
     def test_secret_like_assignment_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
@@ -229,7 +473,9 @@ class McpCase(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "archsmith-mcp")
         tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertIn("archsmith_search_functions", tool_names)
+        self.assertIn("archsmith_recommend_reuse", tool_names)
         self.assertIn("archsmith_materialize_by_name", tool_names)
+        self.assertIn("archsmith_plan_project", tool_names)
         self.assertIn("archsmith_materialize_project", tool_names)
         self.assertIn("archsmith_estimate_savings", tool_names)
         self.assertIn("archsmith_estimate_project_savings", tool_names)
@@ -489,6 +735,107 @@ class McpCase(unittest.TestCase):
         result = json.loads(proc.stdout)
         self.assertEqual(result["count"], 1)
         self.assertTrue((out_dir / "project_cli_fn.py").exists())
+
+    def test_prompts_and_resources_over_stdio(self) -> None:
+        env = os.environ.copy()
+        env["ARCHSMITH_HOME"] = self.temp.name
+        store = ArchSmithStore(Path(self.temp.name))
+        try:
+            proposal = store.propose_function(
+                {
+                    "context": {"user": "u", "profile": "p", "knowledge": "k", "module": "m"},
+                    "name": "resource_fn",
+                    "summary": "metadata only function",
+                    "language": "python",
+                    "code": "def resource_fn():\n    return 1\n",
+                    "signature": "resource_fn()",
+                    "tags": ["metadata"],
+                }
+            )
+            store.approve_function({"revision_id": proposal["revision_id"], "approved_by": "u"})
+            function_id = int(proposal["function_id"])
+        finally:
+            store.close()
+        server = ROOT / "mcp" / "server.py"
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "prompts/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "prompts/get",
+                "params": {"name": "recommend_reuse_for_task", "arguments": {"task": "build metadata only"}},
+            },
+            {"jsonrpc": "2.0", "id": 4, "method": "resources/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": "archsmith://contexts"}},
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "resources/read",
+                "params": {"uri": "archsmith://functions/approved"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "resources/read",
+                "params": {"uri": f"archsmith://functions/{function_id}/metadata"},
+            },
+        ]
+        proc = subprocess.run(
+            [sys.executable, str(server), "--stdio"],
+            input=b"".join(frame(message) for message in messages),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=True,
+            timeout=10,
+        )
+        responses = parse_frames(proc.stdout)
+        prompt_names = {prompt["name"] for prompt in responses[1]["result"]["prompts"]}
+        self.assertIn("recommend_reuse_for_task", prompt_names)
+        self.assertIn("archsmith_recommend_reuse", responses[2]["result"]["messages"][0]["content"]["text"])
+        resource_uris = {resource["uri"] for resource in responses[3]["result"]["resources"]}
+        self.assertIn("archsmith://contexts", resource_uris)
+        self.assertIn(f"archsmith://functions/{function_id}/metadata", resource_uris)
+        for response in responses[4:]:
+            text = response["result"]["contents"][0]["text"]
+            self.assertNotIn("def resource_fn", text)
+            self.assertNotIn('"code"', text)
+
+    def test_structured_error_over_stdio(self) -> None:
+        env = os.environ.copy()
+        env["ARCHSMITH_HOME"] = self.temp.name
+        server = ROOT / "mcp" / "server.py"
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "archsmith_materialize_by_name",
+                    "arguments": {
+                        "name": "missing_fn",
+                        "destination_path": str(Path(self.temp.name) / "out"),
+                        "confirm_write": True,
+                    },
+                },
+            },
+        ]
+        proc = subprocess.run(
+            [sys.executable, str(server), "--stdio"],
+            input=b"".join(frame(message) for message in messages),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=True,
+            timeout=10,
+        )
+        responses = parse_frames(proc.stdout)
+        result = responses[1]["result"]
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["error_code"], "NOT_FOUND")
 
 
 def frame(message: dict[str, object]) -> bytes:
