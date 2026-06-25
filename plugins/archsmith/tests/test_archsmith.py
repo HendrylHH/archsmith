@@ -538,6 +538,59 @@ class StoreCase(unittest.TestCase):
         store.close()
         temp_root.cleanup()
 
+    def test_ast_code_merging(self) -> None:
+        existing = "import math\n\ndef add(a, b):\n    return a + b\n"
+        new_code = "import json\nimport math\n\ndef multiply(a, b):\n    return a * b\n"
+        
+        from mcp.storage import merge_python_code
+        merged = merge_python_code(existing, new_code)
+        self.assertIn("def add(a, b)", merged)
+        self.assertIn("def multiply(a, b)", merged)
+        self.assertIn("import math", merged)
+        self.assertIn("import json", merged)
+        self.assertEqual(merged.count("import math"), 1)
+
+    def test_dependency_compatibility_guard(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        root_path = Path(temp_dir.name)
+        try:
+            req_file = root_path / "requirements.txt"
+            req_file.write_text("numpy>=1.20\nrequests\n", encoding="utf-8")
+            from mcp.storage import detect_missing_dependencies
+            missing = detect_missing_dependencies(root_path, ["requests", "pandas", "numpy"])
+            self.assertEqual(missing, ["pandas"])
+            pkg_file = root_path / "package.json"
+            pkg_file.write_text('{"dependencies": {"lodash": "^4.17.21"}, "devDependencies": {"typescript": "^4.5.4"}}', encoding="utf-8")
+            missing_js = detect_missing_dependencies(root_path, ["lodash", "express"])
+            self.assertEqual(missing_js, ["express"])
+        finally:
+            temp_dir.cleanup()
+
+    def test_structural_code_deduplication(self) -> None:
+        first = self.store.propose_function(
+            {
+                "context": {"user": "u", "profile": "p", "knowledge": "k", "module": "m"},
+                "name": "dedup_original",
+                "summary": "original function",
+                "language": "python",
+                "code": "def process_data(data):\n    res = []\n    for x in data:\n        res.append(x * 2)\n    return res\n",
+            }
+        )
+        self.store.approve_function({"revision_id": first["revision_id"], "approved_by": "u"})
+        second = self.store.propose_function(
+            {
+                "context": {"user": "u", "profile": "p", "knowledge": "k", "module": "m"},
+                "name": "dedup_clone",
+                "summary": "cloned function",
+                "language": "python",
+                "code": "def process_data(data):\n    res = []\n    for y in data:\n        res.append(y * 2)\n    return res\n",
+            }
+        )
+        similar = second.get("similar_approved_function")
+        self.assertIsNotNone(similar)
+        self.assertEqual(similar["name"], "dedup_original")
+        self.assertGreater(similar["similarity"], 0.85)
+
 
 class McpCase(unittest.TestCase):
     def setUp(self) -> None:

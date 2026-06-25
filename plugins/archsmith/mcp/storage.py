@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import ast
 import os
 import re
 import sqlite3
@@ -191,6 +192,135 @@ def apply_replacements(code: str, replacements: Any) -> tuple[str, list[dict[str
         result = result.replace(old, new)
         applied.append({"match_chars": len(old), "replacement_chars": len(new), "count": count})
     return result, applied
+
+
+def are_imports_equal(node1: Any, node2: Any) -> bool:
+    if type(node1) != type(node2):
+        return False
+    if isinstance(node1, ast.Import):
+        names1 = sorted([alias.name + (" as " + alias.asname if alias.asname else "") for alias in node1.names])
+        names2 = sorted([alias.name + (" as " + alias.asname if alias.asname else "") for alias in node2.names])
+        return names1 == names2
+    if isinstance(node1, ast.ImportFrom):
+        if node1.module != node2.module or node1.level != node2.level:
+            return False
+        names1 = sorted([alias.name + (" as " + alias.asname if alias.asname else "") for alias in node1.names])
+        names2 = sorted([alias.name + (" as " + alias.asname if alias.asname else "") for alias in node2.names])
+        return names1 == names2
+    return False
+
+
+def get_node_name(node: Any) -> str | None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    return None
+
+
+def merge_python_code(existing_code: str, new_code: str) -> str:
+    try:
+        existing_tree = ast.parse(existing_code)
+        new_tree = ast.parse(new_code)
+    except Exception:
+        return new_code  # Fallback to overwrite on parsing errors
+        
+    definitions_to_merge = []
+    imports_to_merge = []
+    for node in new_tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports_to_merge.append(node)
+        elif get_node_name(node):
+            definitions_to_merge.append(node)
+            
+    existing_imports = [n for n in existing_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    
+    # 1. Insert imports that don't exist
+    inserted_count = 0
+    for imp in imports_to_merge:
+        duplicate = False
+        for ex_imp in existing_imports:
+            if are_imports_equal(imp, ex_imp):
+                duplicate = True
+                break
+        if not duplicate:
+            existing_tree.body.insert(inserted_count, imp)
+            inserted_count += 1
+            
+    # 2. Merge definitions
+    for def_node in definitions_to_merge:
+        name = get_node_name(def_node)
+        replaced = False
+        for idx, node in enumerate(existing_tree.body):
+            if get_node_name(node) == name:
+                existing_tree.body[idx] = def_node
+                replaced = True
+                break
+        if not replaced:
+            existing_tree.body.append(def_node)
+            
+    if hasattr(ast, "unparse"):
+        try:
+            return ast.unparse(existing_tree)
+        except Exception:
+            pass
+    return new_code
+
+
+def detect_missing_dependencies(target_root: Path, declared_deps: list[str]) -> list[str]:
+    if not declared_deps:
+        return []
+    cleaned_deps = []
+    for d in declared_deps:
+        if isinstance(d, str) and d.strip():
+            # Extract package name (ignoring version specifiers)
+            pkg = re.split(r'[=<>~!]', d.strip())[0].strip().lower()
+            cleaned_deps.append(pkg)
+    if not cleaned_deps:
+        return []
+        
+    missing = list(cleaned_deps)
+    
+    # Walk up target_root up to 3 levels to find requirements.txt or package.json
+    curr = target_root
+    found_manifests = []
+    for _ in range(4):
+        req_file = curr / "requirements.txt"
+        pkg_file = curr / "package.json"
+        if req_file.exists():
+            found_manifests.append(req_file)
+        if pkg_file.exists():
+            found_manifests.append(pkg_file)
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+        
+    if not found_manifests:
+        return missing
+        
+    for manifest in found_manifests:
+        try:
+            content = manifest.read_text(encoding="utf-8", errors="ignore")
+            if manifest.name == "package.json":
+                data = json.loads(content)
+                deps = {}
+                deps.update(data.get("dependencies") or {})
+                deps.update(data.get("devDependencies") or {})
+                deps.update(data.get("peerDependencies") or {})
+                installed_pkgs = {k.lower() for k in deps.keys()}
+            else:
+                installed_pkgs = set()
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    pkg = re.split(r'[=<>~!]', line)[0].strip().lower()
+                    installed_pkgs.add(pkg)
+            
+            missing = [m for m in missing if m not in installed_pkgs]
+        except Exception:
+            continue
+            
+    return missing
+
 
 
 def allowed_roots_from_env() -> list[Path]:
@@ -456,6 +586,44 @@ class ArchSmithStore:
         rows = [self._context_payload(row) for row in self.conn.execute(sql, params)]
         return {"contexts": rows, "count": len(rows)}
 
+    def _find_similar_approved_function(self, code: str, language: str, exclude_function_id: int | None = None) -> dict[str, Any] | None:
+        query = """
+            SELECT r.*, f.name as function_name 
+            FROM revisions r
+            JOIN functions f ON r.function_id = f.id
+            WHERE r.status = 'approved' AND r.language = ?
+        """
+        params = [language]
+        if exclude_function_id:
+            query += " AND r.function_id != ?"
+            params.append(exclude_function_id)
+            
+        rows = self.conn.execute(query, params).fetchall()
+        if not rows:
+            return None
+            
+        normalized_new = "".join(normalize_code_lines(code))
+        best_ratio = 0.0
+        best_row = None
+        for row in rows:
+            prev_code = self._read_revision_code(row)
+            if not prev_code:
+                continue
+            normalized_prev = "".join(normalize_code_lines(prev_code))
+            ratio = difflib.SequenceMatcher(None, normalized_prev, normalized_new).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_row = row
+                
+        if best_ratio > 0.85 and best_row:
+            return {
+                "function_id": best_row["function_id"],
+                "revision_id": best_row["id"],
+                "name": best_row["function_name"],
+                "similarity": round(best_ratio, 3)
+            }
+        return None
+
     def propose_function(self, data: dict[str, Any]) -> dict[str, Any]:
         name = str(data.get("name", "")).strip()
         summary = str(data.get("summary", "")).strip()
@@ -560,6 +728,7 @@ class ArchSmithStore:
         )
         self.conn.commit()
         revision_row = self._revision_by_id(int(cursor.lastrowid))
+        similar = self._find_similar_approved_function(code, language, exclude_function_id=function["id"])
         return {
             "function_id": function["id"],
             "revision_id": revision_row["id"],
@@ -570,6 +739,7 @@ class ArchSmithStore:
             "mutation_threshold": get_mutation_threshold(),
             "requires_new_version": requires_new_version,
             "requires_explicit_approval": True,
+            "similar_approved_function": similar,
         }
 
     def approve_function(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -697,10 +867,20 @@ class ArchSmithStore:
             ).lower()
             reasons: list[str] = []
             if terms:
-                term_hits = sum(1 for term in terms if term in searchable)
-                score = term_hits / len(terms)
-                if term_hits:
-                    reasons.append("term_match")
+                total_weight = 0.0
+                for term in terms:
+                    if term in payload["name"].lower():
+                        total_weight += 3.0
+                    elif payload.get("signature") and term in payload["signature"].lower():
+                        total_weight += 2.0
+                    elif term in payload["summary"].lower():
+                        total_weight += 1.5
+                    elif term in searchable:
+                        total_weight += 1.0
+                max_possible = len(terms) * 3.0
+                score = total_weight / max_possible if max_possible > 0 else 0.0
+                if total_weight > 0:
+                    reasons.append("weighted_term_match")
                 if use_fts:
                     score = min(1.0, score + 0.20)
                     reasons.append("fts_match")
@@ -885,7 +1065,14 @@ class ArchSmithStore:
             payload["target_exists"] = target.exists()
         else:
             target_dir.mkdir(parents=True, exist_ok=True)
-            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            final_code = source.read_text(encoding="utf-8")
+            if data.get("merge", True) and target.exists() and target.suffix == ".py":
+                try:
+                    existing_content = target.read_text(encoding="utf-8")
+                    final_code = merge_python_code(existing_content, final_code)
+                except Exception:
+                    pass
+            target.write_text(final_code, encoding="utf-8")
         if data.get("include_hash"):
             payload["code_hash"] = revision["code_hash"]
         return payload
@@ -903,6 +1090,7 @@ class ArchSmithStore:
                 "overwrite": data.get("overwrite"),
                 "confirm_write": data.get("confirm_write"),
                 "dry_run": data.get("dry_run"),
+                "merge": data.get("merge"),
             }
         )
         payload = {
@@ -966,7 +1154,15 @@ class ArchSmithStore:
         target_root.mkdir(parents=True, exist_ok=True)
         files: list[dict[str, Any]] = []
         for item in plans["items"]:
-            item["target"].write_text(item["code"], encoding="utf-8", newline="\n")
+            target_path = item["target"]
+            final_code = item["code"]
+            if data.get("merge", True) and target_path.exists() and target_path.suffix == ".py":
+                try:
+                    existing_content = target_path.read_text(encoding="utf-8")
+                    final_code = merge_python_code(existing_content, item["code"])
+                except Exception:
+                    pass
+            target_path.write_text(final_code, encoding="utf-8", newline="\n")
             file_payload = {
                 "name": item["name"],
                 "path": str(item["target"]),
@@ -976,6 +1172,7 @@ class ArchSmithStore:
                 "revision": item["revision"],
                 "diff_ratio": item["diff_ratio"],
                 "replacements": item["replacements"],
+                "missing_dependencies": item.get("missing_dependencies", []),
             }
             if data.get("record_reuse", True):
                 try:
@@ -998,7 +1195,19 @@ class ArchSmithStore:
                         "client": data.get("client") or item.get("client"),
                     }
             files.append(file_payload)
-        return {"project_path": str(target_root), "count": len(files), "files": files}
+            
+        all_missing = []
+        for item in plans["items"]:
+            for dep in item.get("missing_dependencies", []):
+                if dep not in all_missing:
+                    all_missing.append(dep)
+                    
+        return {
+            "project_path": str(target_root),
+            "count": len(files),
+            "files": files,
+            "missing_dependencies": all_missing,
+        }
 
     def plan_project(self, data: dict[str, Any]) -> dict[str, Any]:
         plans = self._plan_project_materialization(data, include_memory=True)
@@ -1016,8 +1225,14 @@ class ArchSmithStore:
                     "revision": item["revision"],
                     "diff_ratio": item["diff_ratio"],
                     "replacements": item["replacements"],
+                    "missing_dependencies": item.get("missing_dependencies", []),
                 }
             )
+        all_missing = []
+        for item in plans["items"]:
+            for dep in item.get("missing_dependencies", []):
+                if dep not in all_missing:
+                    all_missing.append(dep)
         return {
             "project_path": str(plans["target_root"]),
             "count": len(files),
@@ -1025,6 +1240,7 @@ class ArchSmithStore:
             "blocked": plans["blocked"],
             "can_materialize": not bool(plans["blocked"]),
             "token_estimate": estimate,
+            "missing_dependencies": all_missing,
         }
 
     def record_reuse(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -1403,6 +1619,8 @@ class ArchSmithStore:
             if replacements:
                 suffix = f"minor adaptation; replacements={len(replacements)}; diff_ratio={diff_ratio}"
                 notes = f"{notes}; {suffix}" if notes else suffix
+            deps = json_loads(revision["dependencies_json"]) or []
+            missing_deps = detect_missing_dependencies(target_root, deps)
             items.append(
                 {
                     "name": revision["function_name"],
@@ -1418,6 +1636,7 @@ class ArchSmithStore:
                     "notes": notes or None,
                     "client": item.get("client"),
                     "memory": memory,
+                    "missing_dependencies": missing_deps,
                 }
             )
         return {"target_root": target_root, "items": items, "blocked": blocked}
